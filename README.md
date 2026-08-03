@@ -1,193 +1,116 @@
 # OpenArm MuJoCo Simulation
 
-Interactive [MuJoCo](https://mujoco.org/) simulation of the **OpenArm v2.0** bimanual robot with real-time keyboard control of every joint and gripper.
-
-![MuJoCo](https://img.shields.io/badge/MuJoCo-≥3.11-blue)
-![Python](https://img.shields.io/badge/Python-≥3.12-3776AB)
-![License](https://img.shields.io/badge/License-Apache_2.0-green)
-
----
-
-## Features
-
-- **Full bimanual control** — independently move all 7 joints on each arm
-- **Gripper operation** — open and close the pinch grippers with mimic-joint synchronisation
-- **Real-time feedback** — joint positions and limits printed to the terminal as you move
-- **Joint limit enforcement** — all movements are clamped to URDF-defined safe ranges
-- **Zero additional dependencies** — runs entirely on `mujoco` and the Python standard library
-- **MuJoCo viewer** — full 3D visualisation with mouse-based camera controls (rotate, pan, zoom)
-
-## Robot Overview
-
-The OpenArm v2.0 is a bimanual robot with two 7-DOF arms and pinch grippers, mounted on a shared body.
-
-| Component | Joints | DOF |
-|-----------|--------|-----|
-| Left arm  | `openarm_left_joint1` – `openarm_left_joint7` | 7 |
-| Left gripper | `openarm_left_finger_joint1` + mimic | 1 |
-| Right arm | `openarm_right_joint1` – `openarm_right_joint7` | 7 |
-| Right gripper | `openarm_right_finger_joint1` + mimic | 1 |
-| **Total** | | **16 independent DOF** |
-
----
+This repository contains a [MuJoCo](https://mujoco.org/) simulation environment for the OpenArm robotic arm. It allows you to load and visualize the OpenArm model using the MuJoCo physics engine in Python.
 
 ## Prerequisites
 
-- **Python** ≥ 3.12
-- **[uv](https://docs.astral.sh/uv/)** — fast Python package manager
-- A display server (X11 / Wayland) for the MuJoCo viewer window
+- Python 3.12 or higher
+- [uv](https://github.com/astral-sh/uv) (recommended for dependency management)
+- A webcam (optional — required only for hand-gesture control)
 
 ## Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/your-org/openarm_mujoco.git
-cd openarm_mujoco
+This project uses `uv` for fast dependency management. You can install the dependencies by syncing the project:
 
-# Install dependencies (creates a virtual environment automatically)
+```bash
 uv sync
 ```
 
-> **Note:** `uv sync` reads `pyproject.toml` and `uv.lock` to install exact, reproducible dependencies — currently just `mujoco ≥ 3.11.0`.
+This will create a virtual environment (`.venv`) and install the required packages, including `mujoco`, `opencv-python`, and `mediapipe`.
 
----
-
-## Quick Start
+Alternatively, if you are not using `uv`, you can install the dependencies using `pip`:
 
 ```bash
-# Run via the script
-uv run python scripts/load_openarm.py
-
-# Or via the installed package entry point
-uv run openarm-mujoco
+pip install mujoco>=3.11.0 opencv-python>=4.8.0 mediapipe>=0.10.0 numpy>=1.24.0
 ```
 
-A MuJoCo viewer window will open showing the OpenArm robot, and the terminal will display the keyboard control reference.
+## Usage
 
----
+### Viewing the Model
 
-## Keyboard Controls
+You can load and visualize the OpenArm model in a passive MuJoCo viewer using the provided script.
 
-Focus the **MuJoCo viewer window** and use these keys:
+Run the following command from the root of the workspace:
 
-### Joint Selection
+```bash
+uv run python scripts/load_openarm.py
+```
 
-| Key | Action |
-|-----|--------|
-| `1` – `7` | Select joint 1 through 7 on the active arm |
-| `Tab` | Toggle active arm between **Left** and **Right** |
+Or, if you have activated the virtual environment manually:
 
-### Joint Movement
+```bash
+python scripts/load_openarm.py
+```
 
-| Key | Action |
-|-----|--------|
-| `↑` | Increase selected joint angle (fine: +0.05 rad) |
-| `↓` | Decrease selected joint angle (fine: −0.05 rad) |
-| `→` | Increase selected joint angle (coarse: +0.25 rad) |
-| `←` | Decrease selected joint angle (coarse: −0.25 rad) |
+This script will parse the URDF model located at `models/openarm_mujoco.urdf` and open a MuJoCo interactive viewer.
 
-### Gripper
+### Keyboard Controls
+
+Once the viewer is open, you can control the robot using your keyboard:
 
 | Key | Action |
 |-----|--------|
-| `G` | Close the gripper on the active arm |
-| `H` | Open the gripper on the active arm |
+| `1` – `7` | Select joint 1 through 7 |
+| `Tab` | Toggle between Left / Right arm |
+| `↑` / `↓` | Fine step (±0.05 rad) |
+| `→` / `←` | Coarse step (±0.25 rad) |
+| `G` | Close gripper |
+| `H` | Open gripper |
+| `R` | Reset all joints to zero |
+| `P` | Print all joint states |
+| `V` | Toggle hand gesture control |
 
-### Utilities
+### Hand Gesture Control 🖐️
 
-| Key | Action |
-|-----|--------|
-| `R` | Reset all joints to zero (home position) |
-| `P` | Print the full joint state of both arms to the terminal |
+The simulation supports real-time control of the robot arms using hand gestures captured by your webcam.
 
-### Mouse (built-in MuJoCo viewer)
+#### Starting Gesture Control
 
-| Action | Control |
-|--------|---------|
-| Rotate camera | Left-click + drag |
-| Pan camera | Right-click + drag |
-| Zoom | Scroll wheel |
+**Option 1 — Toggle at runtime:** Press `V` in the MuJoCo viewer to enable/disable gesture control.
 
----
+**Option 2 — Start with gesture mode:** Launch with the `--gesture` flag:
+
+```bash
+uv run python scripts/load_openarm.py --gesture
+```
+
+#### How It Works
+
+A background thread captures your webcam feed and uses [MediaPipe Hands](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker) to detect hand landmarks in real time. Your hand movements are then mapped to robot joint commands:
+
+| Your Hand Gesture | Robot Joint | Description |
+|---|---|---|
+| Wrist position (horizontal) | Joint 1 | Base yaw — move hand left/right |
+| Wrist position (vertical) | Joint 2 | Shoulder pitch — move hand up/down |
+| Hand distance from camera | Joint 3 | Elbow — move hand closer/further |
+| Palm pitch (tilt forward/back) | Joint 5 | Wrist pitch |
+| Palm roll (tilt left/right) | Joint 6 | Wrist roll |
+| Thumb-index pinch | Gripper | Pinch to close, spread to open |
+
+> **Note:** Joints 4 and 7 (twist/fine-rotation) remain keyboard-controlled as they are difficult to map intuitively to hand gestures.
+
+#### Bimanual Control
+
+- Your **left hand** controls the **left arm**
+- Your **right hand** controls the **right arm**
+- Both arms can be controlled simultaneously when both hands are visible
+
+#### Tips
+
+- Stand about 1–2 feet from your webcam for best tracking
+- An OpenCV window shows the camera feed with hand landmark overlay
+- The system applies smoothing to reduce jitter — movements feel natural but slightly delayed
+- When you remove your hand from view, the corresponding arm holds its last position
+- Keyboard controls remain fully functional while gesture mode is active
 
 ## Project Structure
 
-```
-openarm_mujoco/
-├── assets/                          # Robot description assets
-│   ├── __init__.py                  # Asset path helpers
-│   ├── robot/
-│   │   ├── openarm_v1.0/           # V1.0 robot (meshes, URDF, config)
-│   │   └── openarm_v2.0/           # V2.0 robot (meshes, URDF, config)
-│   │       ├── config/             # Joint limits, axes, origins (YAML)
-│   │       ├── meshes/             # Visual (.dae) and collision (.stl) meshes
-│   │       └── urdf/               # URDF xacro source files
-│   ├── end_effector/
-│   │   ├── pinch_gripper/          # Pinch gripper meshes and URDF
-│   │   └── parallel_link/          # Parallel-link gripper meshes and URDF
-│   └── sensor/
-│       └── zed/                    # ZED camera sensor
-├── models/
-│   ├── openarm_mujoco.urdf         # Compiled URDF (used by the simulation)
-│   └── output.urdf                 # Raw xacro output (pre-path-fix)
-├── scripts/
-│   └── load_openarm.py             # Quick-launch script
-├── src/
-│   └── openarm_mujoco/
-│       ├── __init__.py             # Package entry point (main)
-│       └── sim_controller.py       # Interactive simulation controller
-├── tools/
-│   └── fix_urdf_paths.py           # Converts ROS package:// paths to relative
-├── pyproject.toml                  # Project metadata and dependencies
-├── uv.lock                        # Locked dependency versions
-└── README.md
-```
-
----
-
-## URDF Pipeline
-
-The simulation model is built from xacro sources in `assets/`:
-
-```
-assets/.../openarm_v20.urdf.xacro
-        ↓  (xacro expansion)
-models/output.urdf
-        ↓  (tools/fix_urdf_paths.py)
-models/openarm_mujoco.urdf          ← loaded by MuJoCo
-```
-
-The `fix_urdf_paths.py` tool rewrites `package://openarm_description/` prefixes to relative paths (`../`) so MuJoCo can resolve the mesh files without a ROS workspace.
-
-If you modify the xacro source, regenerate the URDF:
-
-```bash
-# 1. Expand xacro (requires ROS 2 / xacro installed)
-xacro assets/robot/openarm_v2.0/urdf/openarm_v20.urdf.xacro -o models/output.urdf
-
-# 2. Fix mesh paths for MuJoCo
-uv run python tools/fix_urdf_paths.py
-```
-
----
-
-## Joint Limits
-
-All joints enforce their URDF-defined limits. Here are the ranges for the right arm (left arm is mirrored):
-
-| Joint | Lower (rad) | Upper (rad) | Lower (deg) | Upper (deg) | Max Effort (Nm) |
-|-------|-------------|-------------|-------------|-------------|-----------------|
-| J1 | −1.40 | +3.49 | −80° | +200° | 40 |
-| J2 | −0.17 | +3.32 | −10° | +190° | 40 |
-| J3 | −1.57 | +1.57 | −90° | +90° | 27 |
-| J4 | 0.00 | +2.44 | 0° | +140° | 27 |
-| J5 | −1.57 | +1.57 | −90° | +90° | 7 |
-| J6 | −0.79 | +0.79 | −45° | +45° | 7 |
-| J7 | −0.79 | +0.79 | −45° | +45° | 7 |
-| Gripper | −1.57 | 0.00 | −90° | 0° | 7 |
-
----
-
-## License
-
-This project uses assets from [OpenArm](https://github.com/enactic) by Enactic, Inc., licensed under the [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0).
+- `assets/`: Contains assets (like meshes or textures) referenced by the model.
+- `models/`: Contains the robot descriptions. The primary model is `openarm_mujoco.urdf`.
+- `scripts/`: Contains executable scripts, such as `load_openarm.py` for visualizing the robot.
+- `src/openarm_mujoco/`: The main Python package source code.
+  - `sim_controller.py`: Interactive simulation controller with keyboard and gesture input.
+  - `hand_tracker.py`: Webcam-based hand detection using MediaPipe Hands.
+  - `gesture_mapper.py`: Translates hand poses to robot joint targets.
+- `tools/`: Additional tools or utilities for the project.
+- `pyproject.toml`: The Python project configuration file.

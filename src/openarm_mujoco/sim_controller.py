@@ -1,13 +1,17 @@
 """Interactive simulation controller for OpenArm v2.0 bimanual robot.
 
 Provides keyboard-driven control of all arm joints and grippers within
-the MuJoCo passive viewer.  No additional dependencies beyond ``mujoco``.
+the MuJoCo passive viewer.  Supports an optional **hand-gesture control**
+mode using a webcam and MediaPipe Hands.
 """
 
 import time
 
 import mujoco
 import mujoco.viewer
+
+from openarm_mujoco.hand_tracker import HandTracker
+from openarm_mujoco.gesture_mapper import GestureMapper
 
 # Joint step size in radians per keypress
 JOINT_STEP_FINE = 0.05    # Up / Down arrows
@@ -41,6 +45,12 @@ class SimController:
         # Control state
         self.active_arm: str = "left"   # "left" or "right"
         self.selected_joint: int = 0    # 0-6  →  joints 1-7
+
+        # Gesture control state
+        self._gesture_mode: bool = False
+        self._hand_tracker: HandTracker | None = None
+        self._gesture_mappers: dict[str, GestureMapper] = {}
+        self._init_gesture_mappers()
 
     # ------------------------------------------------------------------
     # Joint discovery
@@ -94,6 +104,28 @@ class SimController:
         }
 
     # ------------------------------------------------------------------
+    # Gesture mapper initialisation
+    # ------------------------------------------------------------------
+    def _init_gesture_mappers(self) -> None:
+        """Create a :class:`GestureMapper` for each arm.
+
+        Uses the actual joint limits discovered from the loaded model.
+        """
+        for side in ("left", "right"):
+            arm = self.arms[side]
+            joint_limits = [
+                (j["lower"], j["upper"]) for j in arm["joints"]
+            ]
+            grip = arm["gripper"]
+            gripper_limits = (
+                (grip["lower"], grip["upper"]) if grip else (0.0, 0.0)
+            )
+            self._gesture_mappers[side] = GestureMapper(
+                joint_limits=joint_limits,
+                gripper_limits=gripper_limits,
+            )
+
+    # ------------------------------------------------------------------
     # Keyboard callback
     # ------------------------------------------------------------------
     def _key_callback(self, keycode: int) -> None:
@@ -129,6 +161,10 @@ class SimController:
         # R / r: reset all joints
         elif keycode in (ord("R"), ord("r")):
             self._reset_joints()
+
+        # V / v: toggle gesture control
+        elif keycode in (ord("V"), ord("v")):
+            self._toggle_gesture_mode()
 
         # P / p: print all joint states
         elif keycode in (ord("P"), ord("p")):
@@ -216,6 +252,85 @@ class SimController:
         print("=" * 60)
 
     # ------------------------------------------------------------------
+    # Gesture control
+    # ------------------------------------------------------------------
+    def _toggle_gesture_mode(self) -> None:
+        """Toggle hand-gesture control on or off."""
+        if self._gesture_mode:
+            # Disable
+            if self._hand_tracker is not None:
+                self._hand_tracker.stop()
+                self._hand_tracker = None
+            # Reset smoothing state
+            for mapper in self._gesture_mappers.values():
+                mapper.reset()
+            self._gesture_mode = False
+            print("  ✋ Gesture control DISABLED")
+        else:
+            # Enable
+            tracker = HandTracker(camera_index=0, show_feed=True)
+            if tracker.start():
+                self._hand_tracker = tracker
+                self._gesture_mode = True
+                print(
+                    "  ✋ Gesture control ENABLED "
+                    "— show your hands to the camera!"
+                )
+            else:
+                print(
+                    "  ⚠  Could not open webcam. "
+                    "Gesture control unavailable."
+                )
+
+    def _apply_gesture_commands(self) -> None:
+        """Read gesture state and apply joint targets for each hand.
+
+        Called once per simulation step from :meth:`run`.
+        """
+        if not self._gesture_mode or self._hand_tracker is None:
+            return
+
+        gestures = self._hand_tracker.get_gestures()
+        for side in ("left", "right"):
+            gesture = gestures.get(side)
+            if gesture is None:
+                continue
+
+            mapper = self._gesture_mappers[side]
+            targets = mapper.update(gesture)
+            arm = self.arms[side]
+
+            # Apply joint positions
+            for i, target in enumerate(targets.joint_positions):
+                if target is not None and i < len(arm["joints"]):
+                    jinfo = arm["joints"][i]
+                    clamped = max(
+                        jinfo["lower"],
+                        min(jinfo["upper"], target),
+                    )
+                    self.data.qpos[jinfo["qpos_adr"]] = clamped
+
+            # Apply gripper
+            if (
+                targets.gripper_position is not None
+                and arm["gripper"] is not None
+            ):
+                grip = arm["gripper"]
+                val = max(
+                    grip["lower"],
+                    min(grip["upper"], targets.gripper_position),
+                )
+                self.data.qpos[grip["qpos_adr"]] = val
+                # Synchronise mimic joint (multiplier = -1)
+                mimic = arm["gripper_mimic"]
+                if mimic is not None:
+                    mimic_val = max(
+                        mimic["lower"],
+                        min(mimic["upper"], -val),
+                    )
+                    self.data.qpos[mimic["qpos_adr"]] = mimic_val
+
+    # ------------------------------------------------------------------
     # Controls help banner
     # ------------------------------------------------------------------
     @staticmethod
@@ -242,6 +357,7 @@ class SimController:
 ║  Utilities                                               ║
 ║    R             Reset all joints to zero                ║
 ║    P             Print all joint states                  ║
+║    V             Toggle hand gesture control             ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
 """
@@ -260,6 +376,11 @@ class SimController:
             key_callback=self._key_callback,
         ) as viewer:
             while viewer.is_running():
+                self._apply_gesture_commands()
                 mujoco.mj_step(self.model, self.data)
                 viewer.sync()
                 time.sleep(0.001)  # ≈ 1 kHz – avoids busy-waiting
+
+            # Cleanup gesture tracker on exit
+            if self._hand_tracker is not None:
+                self._hand_tracker.stop()
