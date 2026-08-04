@@ -1,53 +1,64 @@
-"""Map hand gesture data to robot joint targets.
+"""Map per-finger curl data to robot joint targets.
 
-Translates :class:`~openarm_mujoco.hand_tracker.GestureState` objects
-produced by the hand tracker into concrete joint position targets that can
-be applied to the MuJoCo simulation via ``data.ctrl``.
+Translates per-hand :class:`~openarm_mujoco.hand_tracker.GestureState`
+objects (keyed by ``"left"`` / ``"right"``) into concrete joint position
+targets that can be applied to the MuJoCo simulation via ``data.ctrl``.
 
-Hand ↔ Robot Joint Mapping
----------------------------
-The OpenArm v2.0 is a 7-DOF arm.  We use the following intuitive mapping
-so that the operator's hand posture mirrors the arm's posture:
+Finger ↔ Robot Joint Mapping
+------------------------------
+The OpenArm v2.0 is a 7-DOF arm.  Each joint is controlled by bending a
+single finger.  Five fingers of the **right hand** cover joints 1–5; two
+fingers of the **left hand** cover joints 6–7.
 
-=========================================  =========  ========================
-Hand cue                                   Joint      Robot motion
-=========================================  =========  ========================
-Wrist X position (left ↔ right in frame)  J1 (idx 0) Base yaw
-Wrist Y position (up ↔ down in frame)     J2 (idx 1) Shoulder pitch
-Palm forward tilt (pitch angle)            J3 (idx 2) Upper-arm / elbow region
-Finger curl (mean PIP bend, index→pinky)  J4 (idx 3) Elbow flex/extend
-Palm tilt left/right (roll angle)          J5 (idx 4) Wrist pitch
-Palm face-up / face-down (palm normal Z)  J6 (idx 5) Wrist roll
-*(unmapped — keyboard only)*               J7 (idx 6) Fine end-effector twist
-Thumb–index pinch distance                 Gripper    Open / close fingers
-=========================================  =========  ========================
+============  ===========  =========  ========================
+Finger        Camera hand  Joint      Robot motion
+============  ===========  =========  ========================
+Thumb         Right        J1 (idx 0) Base yaw
+Index         Right        J2 (idx 1) Shoulder pitch
+Middle        Right        J3 (idx 2) Upper-arm rotation
+Ring          Right        J4 (idx 3) Elbow flex / extend
+Pinky         Right        J5 (idx 4) Wrist pitch
+Index         Left         J6 (idx 5) Wrist roll
+Middle        Left         J7 (idx 6) Fine end-effector twist
+*(keyboard)*  —            Gripper    Open / close fingers
+============  ===========  =========  ========================
+
+Control model — absolute position
+----------------------------------
+Each finger curl value is in [0, 1]:
+    0 = finger fully straight → joint set to its *lower* limit
+    1 = finger fully curled   → joint set to its *upper* limit
+
+This gives a direct, intuitive mirror: the angle the finger bends is
+proportional to the joint angle.
 
 Design choices
 --------------
-* **EMA smoothing** (configurable alpha) on every output channel to suppress
-  high-frequency noise from the ML tracker.
+* **EMA smoothing** (configurable alpha) on every output channel to
+  suppress high-frequency noise from the ML tracker.
 * **Dead-zone** on the *raw normalised input*: if the change from the last
   accepted sample is below ``dead_zone``, we reuse the previous EMA output
   without advancing the filter.  This prevents microscopically-noisy stable
   poses from walking the joint.
-* **Hysteresis band** on the gripper to avoid rapid open/close chatter.
+* **Curl threshold**: finger curls below ``curl_straight_threshold`` are
+  treated as 0 (straight), so the joint rests at its lower limit when the
+  finger is roughly open.  This eliminates drift when the hand is flat.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import math
 
 from openarm_mujoco.hand_tracker import GestureState
 
 
 # ---------------------------------------------------------------------------
-# Output data class
+# Output data class (unchanged public API)
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass
 class JointTargets:
-    """Target joint positions computed from a single hand gesture frame.
+    """Target joint positions computed from a single control frame.
 
     ``joint_positions`` is a list of length 7 (joints 1–7).  Entries that
     could not be determined from the gesture are set to *None*.
@@ -61,17 +72,28 @@ class JointTargets:
 
 
 # ---------------------------------------------------------------------------
+# Finger → joint mapping table
+# ---------------------------------------------------------------------------
+
+# Each entry: (camera_hand_side, GestureState_attribute_name)
+# Ordered by joint index J1 … J7.
+_FINGER_JOINT_MAP: list[tuple[str, str]] = [
+    ("right", "thumb_curl"),   # J1 — base yaw
+    ("right", "index_curl"),   # J2 — shoulder pitch
+    ("right", "middle_curl"),  # J3 — upper-arm rotation
+    ("right", "ring_curl"),    # J4 — elbow flex / extend
+    ("right", "pinky_curl"),   # J5 — wrist pitch
+    ("left",  "index_curl"),   # J6 — wrist roll
+    ("left",  "middle_curl"),  # J7 — fine end-effector twist
+]
+
+
+# ---------------------------------------------------------------------------
 # Mapper
 # ---------------------------------------------------------------------------
 
-# Gripper pinch thresholds (normalised by frame diagonal).
-# Below CLOSE → fully closed.  Above OPEN → fully open.  Between → interpolate.
-_PINCH_CLOSE_THRESHOLD = 0.04
-_PINCH_OPEN_THRESHOLD  = 0.08
-
-
-class GestureMapper:
-    """Convert normalised gesture data into joint-position targets.
+class FingerJointMapper:
+    """Convert per-finger curl values from both camera hands into joint targets.
 
     Parameters
     ----------
@@ -82,11 +104,15 @@ class GestureMapper:
     smoothing_alpha
         EMA coefficient in (0, 1].  Higher → more responsive (less smooth),
         lower → smoother (more lag).  ``1.0`` disables smoothing.
-        Recommended: 0.08–0.15 for gesture teleop.
+        Recommended: 0.08–0.15 for finger teleop.
     dead_zone
-        Minimum change in the *normalised* input [0, 1] before a new target
-        is produced.  Suppresses jitter when the hand is roughly stationary.
+        Minimum change in the *normalised* finger curl [0, 1] before a new
+        target is produced.  Suppresses jitter when a finger is roughly still.
         Recommended: 0.015–0.03.
+    curl_straight_threshold
+        Finger curl values below this are treated as 0 (hand fully open).
+        Eliminates baseline drift caused by imperfectly flat fingers.
+        Recommended: 0.10–0.20.
     """
 
     def __init__(
@@ -95,153 +121,105 @@ class GestureMapper:
         gripper_limits: tuple[float, float],
         smoothing_alpha: float = 0.10,
         dead_zone: float = 0.02,
+        curl_straight_threshold: float = 0.12,
     ) -> None:
         if len(joint_limits) != 7:
             raise ValueError(
                 f"Expected 7 joint limits, got {len(joint_limits)}"
             )
-        self._joint_limits = list(joint_limits)
-        self._gripper_limits = gripper_limits
-        self._alpha = smoothing_alpha
-        self._dead_zone = dead_zone
+        self._joint_limits    = list(joint_limits)
+        self._gripper_limits  = gripper_limits
+        self._alpha           = smoothing_alpha
+        self._dead_zone       = dead_zone
+        self._curl_threshold  = curl_straight_threshold
 
         # Internal EMA state — *None* until the first update
         self._smoothed: list[float | None] = [None] * 7
-        self._smoothed_grip: float | None = None
-
-        # Previous raw inputs (for dead-zone comparison)
         self._prev_raw: list[float | None] = [None] * 7
-        self._prev_pinch: float | None = None
-
-        # Gripper hysteresis state: True = closed, False = open
-        self._grip_closed: bool = False
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def update(self, gesture: GestureState) -> JointTargets:
-        """Compute new joint targets from the latest gesture."""
-        raw_inputs = self._extract_raw(gesture)
+    def update(self, gestures: dict[str, GestureState]) -> JointTargets:
+        """Compute new joint targets from the latest per-hand gesture states.
+
+        Parameters
+        ----------
+        gestures
+            Dict mapping ``"left"`` / ``"right"`` to their respective
+            :class:`~openarm_mujoco.hand_tracker.GestureState`.
+            Missing hands produce *None* targets for their joints (hold last).
+        """
         targets: list[float | None] = [None] * 7
 
-        for i in range(7):
-            raw = raw_inputs[i]
-            if raw is None:
-                targets[i] = self._smoothed[i]   # hold last known position
+        for joint_idx, (hand_side, finger_attr) in enumerate(_FINGER_JOINT_MAP):
+            gesture = gestures.get(hand_side)
+            if gesture is None:
+                # Hand not visible — hold last known position
+                targets[joint_idx] = self._smoothed[joint_idx]
                 continue
 
-            # Dead-zone check — compare against last *accepted* raw value
-            if self._prev_raw[i] is not None:
-                if abs(raw - self._prev_raw[i]) < self._dead_zone:
-                    # Movement too small — hold the current smoothed value
-                    targets[i] = self._smoothed[i]
-                    continue
+            # Raw curl from the appropriate finger attribute
+            raw_curl: float = getattr(gesture, finger_attr)
 
-            self._prev_raw[i] = raw
+            # Apply straight-finger threshold (treat near-zero curl as 0)
+            if raw_curl < self._curl_threshold:
+                raw_curl = 0.0
+
+            # Normalise to [0, 1] after threshold removal
+            # Remap: [threshold, 1] → [0, 1] only when curl > threshold
+            if raw_curl > 0.0:
+                raw_curl = _clamp01(
+                    (raw_curl - self._curl_threshold)
+                    / (1.0 - self._curl_threshold)
+                )
+
+            # Dead-zone check
+            prev = self._prev_raw[joint_idx]
+            if prev is not None and abs(raw_curl - prev) < self._dead_zone:
+                targets[joint_idx] = self._smoothed[joint_idx]
+                continue
+
+            self._prev_raw[joint_idx] = raw_curl
 
             # Map normalised [0, 1] → joint angle range [lo, hi]
-            lo, hi = self._joint_limits[i]
-            mapped = lo + raw * (hi - lo)
+            lo, hi = self._joint_limits[joint_idx]
+            mapped = lo + raw_curl * (hi - lo)
 
             # EMA smoothing
-            if self._smoothed[i] is None:
-                self._smoothed[i] = mapped
+            if self._smoothed[joint_idx] is None:
+                self._smoothed[joint_idx] = mapped
             else:
-                self._smoothed[i] = (
+                self._smoothed[joint_idx] = (
                     self._alpha * mapped
-                    + (1 - self._alpha) * self._smoothed[i]
+                    + (1 - self._alpha) * self._smoothed[joint_idx]
                 )
-            targets[i] = self._smoothed[i]
-
-        # Gripper — hysteresis-based open / close
-        grip_target = self._compute_gripper(gesture.pinch_distance)
+            targets[joint_idx] = self._smoothed[joint_idx]
 
         return JointTargets(
             joint_positions=targets,
-            gripper_position=grip_target,
+            gripper_position=None,  # Gripper controlled via keyboard (G/H)
         )
 
     def reset(self) -> None:
         """Clear all internal smoothing state."""
         self._smoothed = [None] * 7
-        self._smoothed_grip = None
         self._prev_raw = [None] * 7
-        self._prev_pinch = None
-        self._grip_closed = False
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def seed(self, joint_values: list[float]) -> None:
+        """Pre-fill EMA with known joint values to prevent startup jump.
 
-    def _extract_raw(self, g: GestureState) -> list[float | None]:
-        """Convert gesture fields to normalised [0, 1] values per joint.
-
-        Mapping table
-        -------------
-        J1  wrist_x     Horizontal wrist position → base yaw
-        J2  wrist_y     Vertical wrist position   → shoulder pitch (inverted)
-        J3  palm_pitch  Forward/backward palm tilt → upper-arm rotation
-        J4  finger_curl Mean finger bend (0=straight, 1=fist) → elbow flex
-        J5  palm_roll   Palm roll angle            → wrist pitch
-        J6  palm_facing Palm Z-component           → wrist roll
-        J7  (unmapped)  Keyboard only
+        Parameters
+        ----------
+        joint_values
+            Current actual joint angles (length 7), in radians.
         """
-        # J1: wrist_x already in [0, 1] from MediaPipe
-        j1 = g.wrist_x
-
-        # J2: wrist_y in [0, 1] (0=top, 1=bottom) — invert so raising the
-        #     hand drives the shoulder upward toward its upper limit.
-        j2 = 1.0 - g.wrist_y
-
-        # J3: palm_pitch (±π/2 rad) → [0, 1]
-        #     Palm tilted forward  (pitch > 0) → upper value (arm extends)
-        #     Palm tilted backward (pitch < 0) → lower value (arm retracts)
-        j3 = _clamp01((g.palm_pitch / math.pi) + 0.5)
-
-        # J4: finger_curl proxy — use index-finger MCP-to-tip fold angle.
-        #     GestureState exposes this via `finger_curl` (computed in tracker).
-        #     Straight fingers (curl≈0) → elbow extended (upper range)
-        #     Fist (curl≈1)              → elbow bent    (lower range for J4)
-        j4 = 1.0 - _clamp01(g.finger_curl)   # invert: fist → elbow closed
-
-        # J5: palm_roll (±π rad) → [0, 1]
-        j5 = _clamp01((g.palm_roll / math.pi) + 0.5)
-
-        # J6: palm_facing — use sin(palm_pitch) as a proxy for face-up/face-down.
-        #     Palm facing up (pitch≈−π/2) → one extreme; down (pitch≈+π/2) → other.
-        j6 = _clamp01(0.5 + 0.5 * math.sin(g.palm_pitch))
-
-        # J7: unmapped — hold last position (handled by main loop)
-        j7 = None
-
-        return [j1, j2, j3, j4, j5, j6, j7]
-
-    def _compute_gripper(self, pinch_distance: float) -> float | None:
-        """Hysteresis-based gripper target from thumb–index pinch distance."""
-        lo, hi = self._gripper_limits
-
-        if pinch_distance < _PINCH_CLOSE_THRESHOLD:
-            target = lo   # Fully closed
-        elif pinch_distance > _PINCH_OPEN_THRESHOLD:
-            target = hi   # Fully open
-        else:
-            # Interpolate within the hysteresis band
-            t = (pinch_distance - _PINCH_CLOSE_THRESHOLD) / (
-                _PINCH_OPEN_THRESHOLD - _PINCH_CLOSE_THRESHOLD
-            )
-            target = lo + t * (hi - lo)
-
-        # Smooth the gripper as well (separate, slightly slower alpha)
-        alpha_grip = self._alpha * 0.7
-        if self._smoothed_grip is None:
-            self._smoothed_grip = target
-        else:
-            self._smoothed_grip = (
-                alpha_grip * target
-                + (1 - alpha_grip) * self._smoothed_grip
-            )
-        return self._smoothed_grip
+        for i, val in enumerate(joint_values[:7]):
+            lo, hi = self._joint_limits[i]
+            norm = (val - lo) / (hi - lo) if (hi - lo) > 0 else 0.0
+            self._smoothed[i] = val
+            self._prev_raw[i] = _clamp01(norm)
 
 
 # ---------------------------------------------------------------------------

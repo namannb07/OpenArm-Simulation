@@ -39,7 +39,7 @@ import mujoco.viewer
 import numpy as np
 
 from openarm_mujoco.hand_tracker import HandTracker
-from openarm_mujoco.gesture_mapper import GestureMapper
+from openarm_mujoco.gesture_mapper import FingerJointMapper
 
 # Joint step size in radians per keypress
 JOINT_STEP_FINE   = 0.05   # Up / Down arrows
@@ -254,7 +254,7 @@ class SimController:
         # Gesture control state
         self._gesture_mode:    bool = False
         self._hand_tracker:    Optional[HandTracker] = None
-        self._gesture_mappers: dict[str, GestureMapper] = {}
+        self._gesture_mappers: dict[str, FingerJointMapper] = {}
         self._init_gesture_mappers()
 
         # Seed ctrl targets from initial qpos so arm holds its rest pose
@@ -341,12 +341,13 @@ class SimController:
     # Gesture mapper initialisation
     # ------------------------------------------------------------------
     def _init_gesture_mappers(self) -> None:
+        """Create one FingerJointMapper per robot arm (left/right)."""
         for side in ("left", "right"):
             arm = self.arms[side]
             joint_limits = [(j["lower"], j["upper"]) for j in arm["joints"]]
             grip = arm["gripper"]
             gripper_limits = (grip["lower"], grip["upper"]) if grip else (0.0, 0.0)
-            self._gesture_mappers[side] = GestureMapper(
+            self._gesture_mappers[side] = FingerJointMapper(
                 joint_limits=joint_limits,
                 gripper_limits=gripper_limits,
             )
@@ -360,6 +361,11 @@ class SimController:
             self._print_status()
         elif keycode == _KEY_TAB:
             self.active_arm = "right" if self.active_arm == "left" else "left"
+            # Reset EMA on the newly activated arm so the first finger sample
+            # doesn't cause a sudden jump in joint position.
+            if self._gesture_mode:
+                self._gesture_mappers[self.active_arm].reset()
+                self._seed_mappers_from_ctrl(arm_side=self.active_arm)
             self._print_status()
         elif keycode == _KEY_UP:
             self._move_joint(JOINT_STEP_FINE)
@@ -471,37 +477,42 @@ class SimController:
             else:
                 print("  [WARNING] Could not open webcam. Gesture control unavailable.")
 
-    def _seed_mappers_from_ctrl(self) -> None:
-        """Pre-fill EMA with current ctrl to avoid startup jump."""
-        for side in ("left", "right"):
+    def _seed_mappers_from_ctrl(self, arm_side: str | None = None) -> None:
+        """Pre-fill EMA with current ctrl so there is no jump on first frame.
+
+        Parameters
+        ----------
+        arm_side
+            If given, seed only that arm's mapper.  If *None*, seed both.
+        """
+        sides = (arm_side,) if arm_side else ("left", "right")
+        for side in sides:
             arm    = self.arms[side]
             mapper = self._gesture_mappers[side]
-            for i, jinfo in enumerate(arm["joints"][:7]):
-                val       = self._get_ctrl(jinfo)
-                lo, hi    = jinfo["lower"], jinfo["upper"]
-                norm      = (val - lo) / (hi - lo) if (hi - lo) > 0 else 0.5
-                mapper._smoothed[i]  = val
-                mapper._prev_raw[i]  = max(0.0, min(1.0, norm))
-            grip = arm["gripper"]
-            if grip:
-                mapper._smoothed_grip = self._get_ctrl(grip)
+            joint_values = [
+                self._get_ctrl(jinfo) for jinfo in arm["joints"][:7]
+            ]
+            mapper.seed(joint_values)
 
     def _apply_gesture_commands(self) -> None:
+        """Read latest finger curls and drive the currently active robot arm.
+
+        Both camera hands (left + right) are always passed to the active arm's
+        :class:`~openarm_mujoco.gesture_mapper.FingerJointMapper`.  The mapper
+        uses the right-camera-hand for J1–J5 and the left-camera-hand for J6–J7.
+        Switching arms with Tab simply switches *which robot arm* receives those
+        joint targets — the camera hands keep the same finger assignments.
+        """
         if not self._gesture_mode or self._hand_tracker is None:
             return
         gestures = self._hand_tracker.get_gestures()
-        for side in ("left", "right"):
-            gesture = gestures.get(side)
-            if gesture is None:
-                continue
-            mapper  = self._gesture_mappers[side]
-            targets = mapper.update(gesture)
-            arm     = self.arms[side]
-            for i, target in enumerate(targets.joint_positions):
-                if target is not None and i < len(arm["joints"]):
-                    self._set_ctrl(arm["joints"][i], target)
-            if targets.gripper_position is not None and arm["gripper"]:
-                self._set_ctrl(arm["gripper"], targets.gripper_position)
+        mapper   = self._gesture_mappers[self.active_arm]
+        targets  = mapper.update(gestures)
+        arm      = self.arms[self.active_arm]
+        for i, target in enumerate(targets.joint_positions):
+            if target is not None and i < len(arm["joints"]):
+                self._set_ctrl(arm["joints"][i], target)
+        # Gripper is always keyboard-only (G / H keys)
 
     # ------------------------------------------------------------------
     # Help banners
@@ -516,11 +527,11 @@ class SimController:
 | Joint Selection                                          |
 |   1-7        Select joint 1 through 7                   |
 |   Tab        Toggle between Left / Right arm            |
-| Joint Movement                                           |
+| Joint Movement (keyboard mode)                           |
 |   Up/Down    Fine step   (+/-0.05 rad)                   |
 |   Rt/Left    Coarse step (+/-0.20 rad)                   |
 | Gripper   G = Close   H = Open                          |
-| Utilities R = Reset   P = Print joints   V = Gesture     |
+| Utilities R = Reset   P = Print joints   V = Finger Ctrl |
 +----------------------------------------------------------+
 """
         )
@@ -529,19 +540,26 @@ class SimController:
     def _print_gesture_reference() -> None:
         print(
             """
-Hand Gesture -> Robot Joint Mapping
-  Hand Cue              Joint     Robot Motion
-  --------------------  --------  ---------------------------------
-  Wrist LEFT / RIGHT    J1        Base yaw
-  Wrist UP / DOWN       J2        Shoulder pitch
-  Palm tilt fwd/back    J3        Upper-arm rotation
-  Fingers open/fist     J4        Elbow extend / flex
-  Palm roll L / R       J5        Wrist pitch
-  Palm face up/down     J6        Wrist roll
-  (keyboard only)       J7        Fine end-effector twist
-  Pinch thumb+index     Gripper   Open / close fingers
+Finger -> Robot Joint Mapping
+  Finger       Camera Hand   Joint   Robot Motion
+  -----------  -----------   ------  ----------------------------
+  Thumb        Right         J1      Base yaw
+  Index        Right         J2      Shoulder pitch
+  Middle       Right         J3      Upper-arm rotation
+  Ring         Right         J4      Elbow flex / extend
+  Pinky        Right         J5      Wrist pitch
+  Index        Left          J6      Wrist roll
+  Middle       Left          J7      Fine end-effector twist
+  G / H keys   (keyboard)    Grip    Open / Close gripper
 
-  Tips: keep hand 40-80 cm from camera, move slowly, V to disable
+  Tab                               Switch active arm (LEFT <-> RIGHT)
+  V                                 Disable finger control mode
+
+  Tips:
+   - Keep both hands 40-80 cm from the camera
+   - Bend ONE finger at a time for clean, isolated joint control
+   - Straight fingers = joint at lower limit; fully curled = upper limit
+   - Tab switches which ROBOT ARM receives the finger commands
 """
         )
 

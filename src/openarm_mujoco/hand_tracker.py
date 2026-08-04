@@ -7,6 +7,14 @@ through a thread-safe interface.
 Uses the **MediaPipe Tasks** API (mediapipe >= 1.0) with the
 ``HandLandmarker`` task running in ``VIDEO`` mode.
 
+Per-finger control
+------------------
+Each :class:`GestureState` now exposes five individual finger-curl values
+(``thumb_curl``, ``index_curl``, ``middle_curl``, ``ring_curl``,
+``pinky_curl``) instead of a single aggregated ``finger_curl``.  These are
+used by :class:`~openarm_mujoco.gesture_mapper.FingerJointMapper` to drive
+each of the 7 robot joints directly from a single finger bend.
+
 Dependencies
 ------------
 * ``opencv-python >= 4.8``
@@ -37,6 +45,12 @@ class GestureState:
 
     All spatial values are **normalised to [0, 1]** relative to the camera
     frame (after horizontal flipping) unless noted otherwise.
+
+    Per-finger curl fields
+    ----------------------
+    Each finger's curl is measured independently at its PIP joint
+    (MCP→PIP→DIP angle, where 0 = straight and 1 = fully curled).
+    The thumb uses CMC→MCP→IP joints instead.
     """
 
     handedness: str
@@ -58,14 +72,22 @@ class GestureState:
     palm_pitch: float
     """Pitch angle of the palm in radians (tilt forward / backward)."""
 
-    finger_curl: float
-    """Mean finger curl [0, 1].
-    0 = fully open / straight fingers.
-    1 = fully curled / fist.
+    thumb_curl: float
+    """Curl of the thumb [0, 1].  0 = straight, 1 = fully bent.
+    Measured at the CMC→MCP→IP joints."""
 
-    Computed as the mean of the PIP-joint bend angles for index through pinky,
-    normalised to [0, 1].  Used to drive elbow flex (J4).
-    """
+    index_curl: float
+    """Curl of the index finger [0, 1].  0 = straight, 1 = fully bent.
+    Measured at the MCP→PIP→DIP joints."""
+
+    middle_curl: float
+    """Curl of the middle finger [0, 1].  0 = straight, 1 = fully bent."""
+
+    ring_curl: float
+    """Curl of the ring finger [0, 1].  0 = straight, 1 = fully bent."""
+
+    pinky_curl: float
+    """Curl of the pinky finger [0, 1].  0 = straight, 1 = fully bent."""
 
     pinch_distance: float
     """Euclidean distance between thumb tip and index-finger tip,
@@ -87,17 +109,30 @@ _HandConnections = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
 _draw_landmarks = mp.tasks.vision.drawing_utils.draw_landmarks
 
 # MediaPipe landmark indices (same as the old HandLandmark enum)
+# Wrist / palm
 _WRIST             = 0
+# Thumb (CMC=1, MCP=2, IP=3, TIP=4)
+_THUMB_CMC         = 1
+_THUMB_MCP         = 2
+_THUMB_IP          = 3
 _THUMB_TIP         = 4
+# Index (MCP=5, PIP=6, DIP=7, TIP=8)
 _INDEX_FINGER_MCP  = 5
 _INDEX_FINGER_PIP  = 6
+_INDEX_FINGER_DIP  = 7
 _INDEX_FINGER_TIP  = 8
+# Middle (MCP=9, PIP=10, DIP=11, TIP=12)
 _MIDDLE_FINGER_MCP = 9
 _MIDDLE_FINGER_PIP = 10
+_MIDDLE_FINGER_DIP = 11
+# Ring (MCP=13, PIP=14, DIP=15, TIP=16)
 _RING_FINGER_MCP   = 13
 _RING_FINGER_PIP   = 14
+_RING_FINGER_DIP   = 15
+# Pinky (MCP=17, PIP=18, DIP=19, TIP=20)
 _PINKY_MCP         = 17
 _PINKY_PIP         = 18
+_PINKY_DIP         = 19
 
 # Default model path (relative to project root)
 _DEFAULT_MODEL_PATH = (
@@ -163,40 +198,49 @@ def _compute_palm_orientation(
     return roll, pitch
 
 
-def _compute_finger_curl(landmarks: list, frame_w: int, frame_h: int) -> float:
-    """Mean finger-curl metric in [0, 1].
+def _compute_per_finger_curls(
+    landmarks: list, frame_w: int, frame_h: int
+) -> dict[str, float]:
+    """Compute curl [0, 1] independently for each of the 5 fingers.
 
-    For each finger (index, middle, ring, pinky) we measure the angle at
-    the PIP joint (MCP→PIP→DIP) in 3-D.  A straight finger gives angle ≈ π
-    (180°) and a fully curled finger gives angle ≈ 0.  We map this to [0,1]
-    where 0 = open, 1 = fist, then take the mean across the four fingers.
+    For each finger we measure the angle at the middle joint
+    (MCP→PIP→DIP for index–pinky, CMC→MCP→IP for the thumb) in 3-D.
+    A straight finger gives angle ≈ π (180°) → curl = 0.
+    A fully bent finger gives angle ≈ 0        → curl = 1.
+
+    Returns
+    -------
+    dict with keys ``"thumb"``, ``"index"``, ``"middle"``, ``"ring"``,
+    ``"pinky"``; values in [0, 1].
     """
-    # (MCP_idx, PIP_idx, DIP_idx) for index→pinky
-    finger_indices = [
-        (5,  6,  7),   # index
-        (9,  10, 11),  # middle
-        (13, 14, 15),  # ring
-        (17, 18, 19),  # pinky
-    ]
-    curls: list[float] = []
-    for mcp_i, pip_i, dip_i in finger_indices:
-        mcp = _lm_to_3d(landmarks[mcp_i], frame_w, frame_h)
-        pip = _lm_to_3d(landmarks[pip_i], frame_w, frame_h)
-        dip = _lm_to_3d(landmarks[dip_i], frame_w, frame_h)
+    # (proximal, middle, distal) landmark indices per finger
+    # Thumb uses CMC(1)→MCP(2)→IP(3); others use MCP→PIP→DIP
+    finger_groups: dict[str, tuple[int, int, int]] = {
+        "thumb":  (_THUMB_CMC, _THUMB_MCP, _THUMB_IP),
+        "index":  (_INDEX_FINGER_MCP, _INDEX_FINGER_PIP, _INDEX_FINGER_DIP),
+        "middle": (_MIDDLE_FINGER_MCP, _MIDDLE_FINGER_PIP, _MIDDLE_FINGER_DIP),
+        "ring":   (_RING_FINGER_MCP, _RING_FINGER_PIP, _RING_FINGER_DIP),
+        "pinky":  (_PINKY_MCP, _PINKY_PIP, _PINKY_DIP),
+    }
+    result: dict[str, float] = {}
+    for name, (prox_i, mid_i, dist_i) in finger_groups.items():
+        prox = _lm_to_3d(landmarks[prox_i], frame_w, frame_h)
+        mid  = _lm_to_3d(landmarks[mid_i],  frame_w, frame_h)
+        dist = _lm_to_3d(landmarks[dist_i], frame_w, frame_h)
 
-        v1 = mcp - pip
-        v2 = dip - pip
+        v1 = prox - mid
+        v2 = dist - mid
         n1 = np.linalg.norm(v1)
         n2 = np.linalg.norm(v2)
         if n1 < 1e-6 or n2 < 1e-6:
-            curls.append(0.0)
+            result[name] = 0.0
             continue
 
         cos_angle = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
-        angle = math.acos(cos_angle)       # 0 (bent) … π (straight)
-        curls.append(1.0 - angle / math.pi)  # 0=straight, 1=fist
+        angle = math.acos(cos_angle)          # 0 (bent) … π (straight)
+        result[name] = 1.0 - angle / math.pi  # 0 = straight, 1 = fully curled
 
-    return float(np.mean(curls)) if curls else 0.0
+    return result
 
 
 def _compute_pinch_distance(
@@ -384,7 +428,7 @@ class HandTracker:
 
                     now = time.monotonic()
                     roll, pitch = _compute_palm_orientation(hand_lms, w, h)
-                    curl = _compute_finger_curl(hand_lms, w, h)
+                    curls = _compute_per_finger_curls(hand_lms, w, h)
 
                     gesture = GestureState(
                         handedness=side,
@@ -393,7 +437,11 @@ class HandTracker:
                         hand_scale=_compute_hand_scale(hand_lms, w, h),
                         palm_roll=roll,
                         palm_pitch=pitch,
-                        finger_curl=curl,
+                        thumb_curl=curls["thumb"],
+                        index_curl=curls["index"],
+                        middle_curl=curls["middle"],
+                        ring_curl=curls["ring"],
+                        pinky_curl=curls["pinky"],
                         pinch_distance=_compute_pinch_distance(hand_lms, w, h),
                         timestamp=now,
                     )
@@ -411,23 +459,43 @@ class HandTracker:
                 self._latest_gestures = new_gestures
 
             if self._show_feed:
-                # Overlay: detected hands + live gesture values
+                # Overlay: detected hands + live per-finger curl values
                 if new_gestures:
                     y_off = 30
                     for side, g in new_gestures.items():
-                        lines = [
-                            f"{side.upper()} | wrist=({g.wrist_x:.2f},{g.wrist_y:.2f})",
-                            f"pitch={g.palm_pitch:.2f}  roll={g.palm_roll:.2f}",
-                            f"curl={g.finger_curl:.2f}  pinch={g.pinch_distance:.3f}",
+                        # Header row with hand label
+                        header_color = (0, 220, 255) if side == "right" else (255, 180, 0)
+                        cv2.putText(
+                            frame,
+                            f"{side.upper()} HAND",
+                            (10, y_off),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            header_color, 2, cv2.LINE_AA,
+                        )
+                        y_off += 22
+                        # Per-finger curl bars
+                        finger_data = [
+                            ("Thumb",  g.thumb_curl,  "J1" if side == "right" else "--"),
+                            ("Index",  g.index_curl,  "J2" if side == "right" else "J6"),
+                            ("Middle", g.middle_curl, "J3" if side == "right" else "J7"),
+                            ("Ring",   g.ring_curl,   "J4" if side == "right" else "--"),
+                            ("Pinky",  g.pinky_curl,  "J5" if side == "right" else "--"),
                         ]
-                        for line in lines:
+                        for fname, curl, jlabel in finger_data:
+                            label = f"{fname:<6} [{jlabel}]: {curl:.2f}"
                             cv2.putText(
-                                frame, line, (10, y_off),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                frame, label, (10, y_off),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                                 (0, 255, 128), 1, cv2.LINE_AA,
                             )
-                            y_off += 20
-                        y_off += 8  # gap between hands
+                            # Mini progress bar
+                            bar_x, bar_y = 160, y_off - 10
+                            bar_w = int(curl * 80)
+                            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 80, bar_y + 10), (60, 60, 60), -1)
+                            if bar_w > 0:
+                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 10), header_color, -1)
+                            y_off += 18
+                        y_off += 6  # gap between hands
                 else:
                     cv2.putText(
                         frame, "No hands detected", (10, 30),
