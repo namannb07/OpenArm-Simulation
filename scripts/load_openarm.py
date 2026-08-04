@@ -2,6 +2,13 @@
 
 Supports an optional ``--gesture`` flag to start with hand-gesture
 control already active.
+
+Model loading
+-------------
+The script loads the Anvil URDF (``models/openarm_mujoco.urdf``).
+``SimController`` uses ``mujoco.MjSpec`` to inject position actuators and
+physics settings before compiling the model, so no separate MJCF file is
+required.
 """
 
 from pathlib import Path
