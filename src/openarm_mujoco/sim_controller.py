@@ -120,10 +120,112 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
             act.forcelimited = True
             act.forcerange   = [-flim, flim]
 
-    # ── Gripper equality constraints ──────────────────────────────────
-    # finger_joint2 = -1 × finger_joint1 (mimic, already declared in URDF
-    # via <mimic> tag, but MuJoCo reads it as an equality constraint).
-    # Nothing extra needed here — MuJoCo converts <mimic> automatically.
+    # ── Gripper Mimic Equality Constraints ────────────────────────────
+    # URDF mimic tags are not automatically parsed by MuJoCo MjSpec.
+    # We programmatically add joint equality constraints to force finger_joint2 = -1 × finger_joint1.
+    for side in ("left", "right"):
+        eq = spec.add_equality()
+        eq.name = f"{side}_grip_mimic"
+        eq.type = mujoco.mjtEq.mjEQ_JOINT
+        eq.name1 = f"openarm_{side}_finger_joint2"
+        eq.name2 = f"openarm_{side}_finger_joint1"
+        eq.data[0] = 0.0   # offset
+        eq.data[1] = -1.0  # multiplier (gain)
+        eq.solref = [0.01, 1.0]
+        eq.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
+
+    # ── Simulation Environment Setup ──────────────────────────────────
+    # 1. Skybox Texture
+    sky_tex = spec.add_texture()
+    sky_tex.name = "sky_tex"
+    sky_tex.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
+    sky_tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_GRADIENT
+    sky_tex.rgb1 = [0.4, 0.5, 0.6]  # Light sky blue
+    sky_tex.rgb2 = [0.0, 0.0, 0.0]  # Ground reflection / horizon blend
+    sky_tex.width = 800
+    sky_tex.height = 800
+
+    # 2. Tiled Floor Texture (Checkered Pattern)
+    floor_tex = spec.add_texture()
+    floor_tex.name = "tiled_floor_tex"
+    floor_tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    floor_tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_CHECKER
+    floor_tex.rgb1 = [0.15, 0.15, 0.15]  # Dark grey tiles
+    floor_tex.rgb2 = [0.30, 0.30, 0.30]  # Light grey tiles
+    floor_tex.width = 512
+    floor_tex.height = 512
+    floor_tex.mark = mujoco.mjtMark.mjMARK_CROSS
+    floor_tex.markrgb = [0.1, 0.1, 0.1]
+
+    # 3. Floor Material
+    floor_mat = spec.add_material()
+    floor_mat.name = "tiled_floor_mat"
+    floor_mat.textures = ["tiled_floor_tex"] + [""] * 9
+    floor_mat.roughness = 0.5
+    floor_mat.shininess = 0.1
+
+    # 4. Floor Geom
+    floor_geom = spec.worldbody.add_geom()
+    floor_geom.name = "floor"
+    floor_geom.type = mujoco.mjtGeom.mjGEOM_PLANE
+    floor_geom.size = [10.0, 10.0, 0.1]
+    floor_geom.pos = [0.0, 0.0, 0.0]
+    floor_geom.material = "tiled_floor_mat"
+
+    # 5. Table Setup
+    # Size: width=44cm, depth=90cm, height=30cm (half-extents: [0.22, 0.45, 0.15])
+    # Position: In front of the robot stand, centered in Y, sitting on the floor (z = half-height)
+    table_size = [0.22, 0.45, 0.15]
+    table_body = spec.worldbody.add_body()
+    table_body.name = "table"
+    table_body.pos = [0.45, 0.0, table_size[2]]
+
+    table_geom = table_body.add_geom()
+    table_geom.name = "table_geom"
+    table_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    table_geom.size = table_size
+    table_geom.rgba = [0.4, 0.3, 0.25, 1.0]  # Dark wood color
+    table_geom.friction = [0.5, 0.005, 0.0001]
+
+    # 6. Lighting Setup (Key + Fill)
+    # Sun light casting realistic shadows
+    sun = spec.worldbody.add_light()
+    sun.name = "sun"
+    sun.pos = [0.0, 0.0, 3.0]
+    sun.dir = [0.0, 0.0, -1.0]
+    sun.castshadow = True
+    sun.diffuse = [0.8, 0.8, 0.8]
+    sun.ambient = [0.3, 0.3, 0.3]
+    sun.specular = [0.2, 0.2, 0.2]
+
+    # Ambient fill light from the side to illuminate shaded robot details
+    fill_light = spec.worldbody.add_light()
+    fill_light.name = "fill_light"
+    fill_light.pos = [2.0, 2.0, 2.0]
+    fill_light.dir = [-1.0, -1.0, -1.0]
+    fill_light.castshadow = False
+    fill_light.diffuse = [0.4, 0.4, 0.4]
+
+    # 7. Cardboard Box (Dynamic physical object)
+    # Box size (half-extents): 7.5cm x 7.5cm x 7.5cm (15cm cube)
+    box_size = [0.075, 0.075, 0.075]
+    box_body = spec.worldbody.add_body()
+    box_body.name = "cardboard_box"
+    # Position: Sitting on the table top (table top height = 0.30m + box half-height = 0.075m)
+    box_body.pos = [0.38, 0.0, 0.30 + box_size[2]]
+    box_body.add_freejoint()
+
+    box_geom = box_body.add_geom()
+    box_geom.name = "cardboard_box_geom"
+    box_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    box_geom.size = box_size
+    box_geom.rgba = [0.76, 0.60, 0.42, 1.0]  # Cardboard brown
+    box_geom.mass = 0.12  # Realistic empty/light cardboard box mass: 120 grams
+    box_geom.friction = [0.8, 0.005, 0.0001]  # High slide friction for stable grasping
+
+    # Compliance/softness to mimic cardboard deformability and damp contacts
+    box_geom.solref = [0.04, 1.0]
+    box_geom.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
 
     return spec.compile()
 
@@ -299,17 +401,10 @@ class SimController:
         print(f"  Gripper ({self.active_arm}): {self._get_ctrl(grip):+.3f} rad")
 
     def _reset_joints(self) -> None:
-        for side in ("left", "right"):
-            arm = self.arms[side]
-            for jinfo in arm["joints"]:
-                rest = self._clamp(0.0, jinfo["lower"], jinfo["upper"])
-                self._set_ctrl(jinfo, rest)
-            grip = arm["gripper"]
-            if grip:
-                rest = self._clamp(0.0, grip["lower"], grip["upper"])
-                self._set_ctrl(grip, rest)
+        self.data.qpos[:] = self.model.qpos0[:]
         self.data.qvel[:] = 0.0
-        print("  [OK] All joints reset to 0.")
+        self._sync_ctrl_to_qpos()
+        print("  [OK] Simulation reset to initial state (robot & box).")
         self._print_status()
 
     # ------------------------------------------------------------------
