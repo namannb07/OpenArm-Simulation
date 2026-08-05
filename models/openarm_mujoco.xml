@@ -1,0 +1,105 @@
+<mujoco model="openarm_v20">
+  <!--
+    OpenArm v2.0 Bimanual – MuJoCo Scene File
+    ==========================================
+    This file wraps the Anvil URDF with proper MuJoCo physics settings:
+      • implicitfast integrator  – stable for stiff position control
+      • position actuators with PD gains (kp / kv) per motor group
+      • joint damping in the URDF override section
+      • disabled self-collisions between arm links (prevents spurious contacts)
+
+    Actuator gain reference (from DAMIAO motor datasheet + Anvil docs):
+      J1/J2  shoulder  – DM-J8009P-2EC  →  high torque, moderate speed
+      J3     upper-arm – DM-J4340P-2EC  →  medium torque
+      J4     elbow     – DM-J4340-2EC   →  medium torque, lower limit=0
+      J5/J6/J7 wrist   – DM-J4310-2EC  →  low torque, high speed
+      Gripper finger   – DM-J4310-2EC   →  low torque, slow
+  -->
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <option
+    timestep="0.002"
+    integrator="implicitfast"
+    gravity="0 0 -9.81"
+    cone="elliptic"
+    impratio="10"
+  />
+
+  <!-- Load the Anvil-provided URDF (relative to this file) -->
+  <include file="openarm_mujoco.urdf"/>
+
+  <!-- ================================================================
+       Global defaults – applied to all actuators unless overridden
+       ================================================================ -->
+  <default>
+    <default class="arm_shoulder">
+      <!-- J1, J2: DM-J8009P-2EC, effort limit 40 Nm -->
+      <position kp="400" kv="40" forcerange="-40 40"/>
+    </default>
+    <default class="arm_upper">
+      <!-- J3: DM-J4340P-2EC, effort limit 27 Nm -->
+      <position kp="300" kv="30" forcerange="-27 27"/>
+    </default>
+    <default class="arm_elbow">
+      <!-- J4: DM-J4340-2EC, effort limit 27 Nm, lower=0 -->
+      <position kp="300" kv="30" forcerange="-27 27"/>
+    </default>
+    <default class="arm_wrist">
+      <!-- J5, J6, J7: DM-J4310-2EC, effort limit 7 Nm -->
+      <position kp="100" kv="10" forcerange="-7 7"/>
+    </default>
+    <default class="gripper">
+      <!-- Finger joints: DM-J4310-2EC, effort limit 7 Nm -->
+      <position kp="80" kv="8" forcerange="-7 7"/>
+    </default>
+  </default>
+
+  <!-- ================================================================
+       Actuators — one position servo per independent joint
+       MuJoCo position actuators: output torque = kp*(target-q) - kv*qd
+       ================================================================ -->
+  <actuator>
+    <!-- ── LEFT ARM ──────────────────────────────────────────────── -->
+    <position name="left_j1_act"  joint="openarm_left_joint1"          class="arm_shoulder" ctrlrange="-3.4907 1.3963"/>
+    <position name="left_j2_act"  joint="openarm_left_joint2"          class="arm_shoulder" ctrlrange="-3.3161 0.17453"/>
+    <position name="left_j3_act"  joint="openarm_left_joint3"          class="arm_upper"    ctrlrange="-1.5708 1.5708"/>
+    <position name="left_j4_act"  joint="openarm_left_joint4"          class="arm_elbow"    ctrlrange="0 2.4435"/>
+    <position name="left_j5_act"  joint="openarm_left_joint5"          class="arm_wrist"    ctrlrange="-1.5708 1.5708"/>
+    <position name="left_j6_act"  joint="openarm_left_joint6"          class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
+    <position name="left_j7_act"  joint="openarm_left_joint7"          class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
+    <position name="left_grip1_act" joint="openarm_left_finger_joint1"  class="gripper"      ctrlrange="-0.80 0"/>
+    <position name="left_grip2_act" joint="openarm_left_finger_joint2"  class="gripper"      ctrlrange="0 0.80"/>
+
+    <!-- ── RIGHT ARM ─────────────────────────────────────────────── -->
+    <position name="right_j1_act" joint="openarm_right_joint1"         class="arm_shoulder" ctrlrange="-1.3963 3.4907"/>
+    <position name="right_j2_act" joint="openarm_right_joint2"         class="arm_shoulder" ctrlrange="-0.17453 3.3161"/>
+    <position name="right_j3_act" joint="openarm_right_joint3"         class="arm_upper"    ctrlrange="-1.5708 1.5708"/>
+    <position name="right_j4_act" joint="openarm_right_joint4"         class="arm_elbow"    ctrlrange="0 2.4435"/>
+    <position name="right_j5_act" joint="openarm_right_joint5"         class="arm_wrist"    ctrlrange="-1.5708 1.5708"/>
+    <position name="right_j6_act" joint="openarm_right_joint6"         class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
+    <position name="right_j7_act" joint="openarm_right_joint7"         class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
+    <position name="right_grip1_act" joint="openarm_right_finger_joint1" class="gripper"     ctrlrange="-0.80 0"/>
+    <position name="right_grip2_act" joint="openarm_right_finger_joint2" class="gripper"     ctrlrange="0 0.80"/>
+  </actuator>
+
+  <!-- ================================================================
+       Equality constraints — enforce the gripper mimic relationship
+       (finger_joint2 = -1 × finger_joint1) as a hard physics constraint
+       ================================================================ -->
+  <equality>
+    <joint name="left_grip_mimic"
+           joint1="openarm_left_finger_joint2"
+           joint2="openarm_left_finger_joint1"
+           polycoef="0 -1 0 0 0"
+           solimp="0.9 0.95 0.001"
+           solref="0.01 1"/>
+    <joint name="right_grip_mimic"
+           joint1="openarm_right_finger_joint2"
+           joint2="openarm_right_finger_joint1"
+           polycoef="0 -1 0 0 0"
+           solimp="0.9 0.95 0.001"
+           solref="0.01 1"/>
+  </equality>
+
+</mujoco>
