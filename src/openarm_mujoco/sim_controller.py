@@ -67,7 +67,8 @@ _ACTUATOR_SPECS = [
     ("openarm_{side}_joint5",          "{side}_j5_act",      100, 10,  7.0),
     ("openarm_{side}_joint6",          "{side}_j6_act",      100, 10,  7.0),
     ("openarm_{side}_joint7",          "{side}_j7_act",      100, 10,  7.0),
-    ("openarm_{side}_finger_joint1",   "{side}_grip_act",     80,  8,  7.0),
+    ("openarm_{side}_finger_joint1",   "{side}_grip1_act",    80,  8,  7.0),
+    ("openarm_{side}_finger_joint2",   "{side}_grip2_act",    80,  8,  7.0),
 ]
 
 
@@ -120,19 +121,19 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
             act.forcelimited = True
             act.forcerange   = [-flim, flim]
 
-    # ── Gripper Mimic Equality Constraints ────────────────────────────
-    # URDF mimic tags are not automatically parsed by MuJoCo MjSpec.
-    # We programmatically add joint equality constraints to force finger_joint2 = -1 × finger_joint1.
+    # ── Gripper Collision Exclusions ───────────────────────────────────
+    # Exclude internal contact between finger links and end-effector base link
+    # to prevent physics contact forces from tearing the mimic equality constraint.
     for side in ("left", "right"):
-        eq = spec.add_equality()
-        eq.name = f"{side}_grip_mimic"
-        eq.type = mujoco.mjtEq.mjEQ_JOINT
-        eq.name1 = f"openarm_{side}_finger_joint2"
-        eq.name2 = f"openarm_{side}_finger_joint1"
-        eq.data[0] = 0.0   # offset
-        eq.data[1] = -1.0  # multiplier (gain)
-        eq.solref = [0.01, 1.0]
-        eq.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
+        ex1 = spec.add_exclude()
+        ex1.bodyname1 = f"openarm_{side}_ee_base_link"
+        ex1.bodyname2 = f"openarm_{side}_ee_link1"
+        ex2 = spec.add_exclude()
+        ex2.bodyname1 = f"openarm_{side}_ee_base_link"
+        ex2.bodyname2 = f"openarm_{side}_ee_link2"
+        ex3 = spec.add_exclude()
+        ex3.bodyname1 = f"openarm_{side}_ee_link1"
+        ex3.bodyname2 = f"openarm_{side}_ee_link2"
 
     # ── Simulation Environment Setup ──────────────────────────────────
     # 1. Skybox Texture
@@ -174,7 +175,6 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
 
     # 5. Table Setup
     # Size: width=44cm, depth=90cm, height=30cm (half-extents: [0.22, 0.45, 0.15])
-    # Position: In front of the robot stand, centered in Y, sitting on the floor (z = half-height)
     table_size = [0.22, 0.45, 0.15]
     table_body = spec.worldbody.add_body()
     table_body.name = "table"
@@ -188,7 +188,6 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
     table_geom.friction = [0.5, 0.005, 0.0001]
 
     # 6. Lighting Setup (Key + Fill)
-    # Sun light casting realistic shadows
     sun = spec.worldbody.add_light()
     sun.name = "sun"
     sun.pos = [0.0, 0.0, 3.0]
@@ -198,7 +197,6 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
     sun.ambient = [0.3, 0.3, 0.3]
     sun.specular = [0.2, 0.2, 0.2]
 
-    # Ambient fill light from the side to illuminate shaded robot details
     fill_light = spec.worldbody.add_light()
     fill_light.name = "fill_light"
     fill_light.pos = [2.0, 2.0, 2.0]
@@ -206,26 +204,75 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
     fill_light.castshadow = False
     fill_light.diffuse = [0.4, 0.4, 0.4]
 
-    # 7. Cardboard Box (Dynamic physical object)
-    # Box size (half-extents): 7.5cm x 7.5cm x 7.5cm (15cm cube)
-    box_size = [0.075, 0.075, 0.075]
+    # 7. Open Cardboard Box with 4 Hinged Flaps
+    # Container size: 15cm x 15cm x 15cm outer cube
     box_body = spec.worldbody.add_body()
     box_body.name = "cardboard_box"
-    # Position: Sitting on the table top (table top height = 0.30m + box half-height = 0.075m)
-    box_body.pos = [0.38, 0.0, 0.30 + box_size[2]]
+    box_body.pos = [0.38, 0.0, 0.30]  # Sitting on table top
     box_body.add_freejoint()
 
-    box_geom = box_body.add_geom()
-    box_geom.name = "cardboard_box_geom"
-    box_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-    box_geom.size = box_size
-    box_geom.rgba = [0.76, 0.60, 0.42, 1.0]  # Cardboard brown
-    box_geom.mass = 0.12  # Realistic empty/light cardboard box mass: 120 grams
-    box_geom.friction = [0.8, 0.005, 0.0001]  # High slide friction for stable grasping
+    # Bottom plate
+    bottom = box_body.add_geom()
+    bottom.name = "cardboard_box_bottom"
+    bottom.type = mujoco.mjtGeom.mjGEOM_BOX
+    bottom.size = [0.075, 0.075, 0.0025]
+    bottom.pos = [0.0, 0.0, 0.0025]
+    bottom.rgba = [0.76, 0.60, 0.42, 1.0]  # Cardboard brown
+    bottom.mass = 0.04
+    bottom.friction = [0.8, 0.005, 0.0001]
+    bottom.solref = [0.04, 1.0]
+    bottom.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
 
-    # Compliance/softness to mimic cardboard deformability and damp contacts
-    box_geom.solref = [0.04, 1.0]
-    box_geom.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
+    # 4 side walls
+    wall_defs = [
+        ("box_wall_front", [0.075, 0.002, 0.075], [0.0, 0.073, 0.0775]),
+        ("box_wall_back",  [0.075, 0.002, 0.075], [0.0, -0.073, 0.0775]),
+        ("box_wall_left",  [0.002, 0.071, 0.075], [-0.073, 0.0, 0.0775]),
+        ("box_wall_right", [0.002, 0.071, 0.075], [0.073, 0.0, 0.0775]),
+    ]
+    for wname, wsize, wpos in wall_defs:
+        wgeom = box_body.add_geom()
+        wgeom.name = wname
+        wgeom.type = mujoco.mjtGeom.mjGEOM_BOX
+        wgeom.size = wsize
+        wgeom.pos = wpos
+        wgeom.rgba = [0.76, 0.60, 0.42, 1.0]
+        wgeom.mass = 0.02
+        wgeom.friction = [0.8, 0.005, 0.0001]
+        wgeom.solref = [0.04, 1.0]
+        wgeom.solimp = [0.9, 0.95, 0.001, 0.5, 2.0]
+
+    # 4 hinged top flaps (hinged at top edges of walls z = 0.1525)
+    # q = 0.0 rad represents FLAP CLOSED (flat over box top).
+    # q = 1.0 rad represents FLAP OPEN (~57 deg angled upward/outward).
+    # Range [0.0, 2.4] rad allows full rotation when pushed.
+    flaps_info = [
+        ("box_flap_front", [0.0, 0.073, 0.1525], [-1, 0, 0], [0.0, -0.036, 0.0], [0.073, 0.036, 0.0015]),
+        ("box_flap_back",  [0.0, -0.073, 0.1525], [1, 0, 0], [0.0, +0.036, 0.0], [0.073, 0.036, 0.0015]),
+        ("box_flap_left",  [-0.073, 0.0, 0.1525], [0, 1, 0], [+0.036, 0.0, 0.0], [0.036, 0.071, 0.0015]),
+        ("box_flap_right", [+0.073, 0.0, 0.1525], [0, -1, 0], [-0.036, 0.0, 0.0], [0.036, 0.071, 0.0015]),
+    ]
+    for fname, fpos, faxis, fgpos, fgsize in flaps_info:
+        f_body = box_body.add_body()
+        f_body.name = fname
+        f_body.pos = fpos
+        fj = f_body.add_joint()
+        fj.name = f"{fname}_joint"
+        fj.type = mujoco.mjtJoint.mjJNT_HINGE
+        fj.axis = faxis
+        fj.range[0] = 0.0
+        fj.range[1] = 2.4
+        fj.damping[0] = 0.01
+        fj.stiffness[0] = 0.05   # Moderate cardboard crease spring
+        fj.springref = 1.8       # Holds flap standing wide OPEN (~103 deg) under gravity
+        fg = f_body.add_geom()
+        fg.name = f"{fname}_geom"
+        fg.type = mujoco.mjtGeom.mjGEOM_BOX
+        fg.size = fgsize
+        fg.pos = fgpos
+        fg.rgba = [0.80, 0.64, 0.45, 1.0]
+        fg.mass = 0.01
+        fg.friction = [0.8, 0.005, 0.0001]
 
     return spec.compile()
 
@@ -257,6 +304,19 @@ class SimController:
         self._gesture_mappers: dict[str, FingerJointMapper] = {}
         self._init_gesture_mappers()
 
+        # Seed initial flap joint positions to wide open rest angles (1.8 rad ~ 103 deg)
+        for flap_jnt in (
+            "box_flap_front_joint",
+            "box_flap_back_joint",
+            "box_flap_left_joint",
+            "box_flap_right_joint",
+        ):
+            j_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, flap_jnt)
+            if j_id >= 0:
+                adr = self.model.jnt_qposadr[j_id]
+                self.model.qpos0[adr] = 1.8
+                self.data.qpos[adr] = 1.8
+
         # Seed ctrl targets from initial qpos so arm holds its rest pose
         self._sync_ctrl_to_qpos()
 
@@ -277,13 +337,18 @@ class SimController:
                 else:
                     print(f"  [WARNING] Joint not found: {jnt_name}")
 
-            grip_info = self._lookup(
+            grip1_info = self._lookup(
                 f"openarm_{side}_finger_joint1",
-                f"{side}_grip_act",
+                f"{side}_grip1_act",
+            )
+            grip2_info = self._lookup(
+                f"openarm_{side}_finger_joint2",
+                f"{side}_grip2_act",
             )
             self.arms[side] = {
-                "joints":  joints,
-                "gripper": grip_info,
+                "joints":   joints,
+                "gripper":  grip1_info,
+                "gripper2": grip2_info,
             }
 
     def _lookup(self, jnt_name: str, act_name: str) -> dict | None:
@@ -312,9 +377,12 @@ class SimController:
         for side in ("left", "right"):
             for jinfo in self.arms[side]["joints"]:
                 self._set_ctrl(jinfo, float(self.data.qpos[jinfo["qpos_adr"]]))
-            grip = self.arms[side]["gripper"]
-            if grip:
-                self._set_ctrl(grip, float(self.data.qpos[grip["qpos_adr"]]))
+            grip1 = self.arms[side]["gripper"]
+            if grip1:
+                self._set_ctrl(grip1, float(self.data.qpos[grip1["qpos_adr"]]))
+            grip2 = self.arms[side].get("gripper2")
+            if grip2:
+                self._set_ctrl(grip2, float(self.data.qpos[grip2["qpos_adr"]]))
 
     @staticmethod
     def _clamp(v: float, lo: float, hi: float) -> float:
@@ -355,9 +423,15 @@ class SimController:
     # ------------------------------------------------------------------
     # Keyboard callback
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Keyboard callback
+    # ------------------------------------------------------------------
     def _key_callback(self, keycode: int) -> None:
         if ord("1") <= keycode <= ord("7"):
             self.selected_joint = keycode - ord("1")
+            self._print_status()
+        elif keycode in (ord("G"), ord("g"), ord("8")):
+            self.selected_joint = 7  # 7 = Gripper mode
             self._print_status()
         elif keycode == _KEY_TAB:
             self.active_arm = "right" if self.active_arm == "left" else "left"
@@ -368,17 +442,29 @@ class SimController:
                 self._seed_mappers_from_ctrl(arm_side=self.active_arm)
             self._print_status()
         elif keycode == _KEY_UP:
-            self._move_joint(JOINT_STEP_FINE)
+            if self.selected_joint == 7:
+                self._move_gripper(JOINT_STEP_FINE)  # Up closes gripper (towards 0 rad)
+            else:
+                self._move_joint(JOINT_STEP_FINE)
         elif keycode == _KEY_DOWN:
-            self._move_joint(-JOINT_STEP_FINE)
+            if self.selected_joint == 7:
+                self._move_gripper(-JOINT_STEP_FINE)  # Down opens gripper (towards -0.80 rad)
+            else:
+                self._move_joint(-JOINT_STEP_FINE)
         elif keycode == _KEY_RIGHT:
-            self._move_joint(JOINT_STEP_COARSE)
+            if self.selected_joint == 7:
+                self._move_gripper(JOINT_STEP_COARSE)
+            else:
+                self._move_joint(JOINT_STEP_COARSE)
         elif keycode == _KEY_LEFT:
-            self._move_joint(-JOINT_STEP_COARSE)
-        elif keycode in (ord("G"), ord("g")):
-            self._move_gripper(-GRIPPER_STEP)
+            if self.selected_joint == 7:
+                self._move_gripper(-JOINT_STEP_COARSE)
+            else:
+                self._move_joint(-JOINT_STEP_COARSE)
         elif keycode in (ord("H"), ord("h")):
-            self._move_gripper(GRIPPER_STEP)
+            # H also selects the Gripper
+            self.selected_joint = 7
+            self._print_status()
         elif keycode in (ord("R"), ord("r")):
             self._reset_joints()
         elif keycode in (ord("V"), ord("v")):
@@ -399,12 +485,16 @@ class SimController:
         self._print_status()
 
     def _move_gripper(self, delta: float) -> None:
-        arm  = self.arms[self.active_arm]
-        grip = arm["gripper"]
-        if grip is None:
+        arm   = self.arms[self.active_arm]
+        grip1 = arm["gripper"]
+        grip2 = arm.get("gripper2")
+        if grip1 is None:
             return
-        self._set_ctrl(grip, self._get_ctrl(grip) + delta)
-        print(f"  Gripper ({self.active_arm}): {self._get_ctrl(grip):+.3f} rad")
+        new_val = self._get_ctrl(grip1) + delta
+        self._set_ctrl(grip1, new_val)
+        if grip2 is not None:
+            self._set_ctrl(grip2, -new_val)
+        self._print_status()
 
     def _reset_joints(self) -> None:
         self.data.qpos[:] = self.model.qpos0[:]
@@ -428,6 +518,16 @@ class SimController:
                 f"target={target:+.3f}  actual={actual:+.3f} rad  "
                 f"[{jinfo['lower']:.2f}, {jinfo['upper']:.2f}]"
             )
+        elif self.selected_joint == 7 and arm["gripper"]:
+            grip   = arm["gripper"]
+            target = self._get_ctrl(grip)
+            actual = float(self.data.qpos[grip["qpos_adr"]])
+            print(
+                f"  [{self.active_arm.upper():>5}] "
+                f"Gripper: "
+                f"target={target:+.3f}  actual={actual:+.3f} rad  "
+                f"[{grip['lower']:.2f}, {grip['upper']:.2f}]"
+            )
 
     def _print_all_joints(self) -> None:
         print("\n" + "=" * 68)
@@ -448,7 +548,12 @@ class SimController:
                 grip   = arm["gripper"]
                 target = self._get_ctrl(grip)
                 actual = float(self.data.qpos[grip["qpos_adr"]])
-                print(f"      Gripper: target={target:+.4f}  actual={actual:+.4f} rad")
+                sel = ">" if (side == self.active_arm and self.selected_joint == 7) else " "
+                print(
+                    f"    {sel} Gripper: target={target:+.4f}  "
+                    f"actual={actual:+.4f} rad  "
+                    f"[{grip['lower']:.2f}, {grip['upper']:.2f}]"
+                )
             print()
         print("=" * 68)
 
@@ -512,7 +617,7 @@ class SimController:
         for i, target in enumerate(targets.joint_positions):
             if target is not None and i < len(arm["joints"]):
                 self._set_ctrl(arm["joints"][i], target)
-        # Gripper is always keyboard-only (G / H keys)
+        # Gripper is always keyboard-only (G / H keys or Arrow keys when selected)
 
     # ------------------------------------------------------------------
     # Help banners
@@ -524,14 +629,14 @@ class SimController:
 +----------------------------------------------------------+
 |       OpenArm Interactive Simulation Controls            |
 +----------------------------------------------------------+
-| Joint Selection                                          |
-|   1-7        Select joint 1 through 7                   |
-|   Tab        Toggle between Left / Right arm            |
-| Joint Movement (keyboard mode)                           |
+| Selection & Control                                      |
+|   1-7        Select joint 1 through 7                    |
+|   G / 8      Select Gripper                              |
+|   Tab        Toggle active arm (Left / Right)            |
+| Joint / Gripper Movement                                 |
 |   Up/Down    Fine step   (+/-0.05 rad)                   |
 |   Rt/Left    Coarse step (+/-0.20 rad)                   |
-| Gripper   G = Close   H = Open                          |
-| Utilities R = Reset   P = Print joints   V = Finger Ctrl |
+| Utilities    R = Reset   P = Print joints   V = Finger Ctrl|
 +----------------------------------------------------------+
 """
         )

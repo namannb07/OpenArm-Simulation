@@ -68,7 +68,8 @@
     <position name="left_j5_act"  joint="openarm_left_joint5"          class="arm_wrist"    ctrlrange="-1.5708 1.5708"/>
     <position name="left_j6_act"  joint="openarm_left_joint6"          class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
     <position name="left_j7_act"  joint="openarm_left_joint7"          class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
-    <position name="left_grip_act" joint="openarm_left_finger_joint1"  class="gripper"      ctrlrange="-1.5708 0"/>
+    <position name="left_grip1_act" joint="openarm_left_finger_joint1"  class="gripper"      ctrlrange="-0.80 0"/>
+    <position name="left_grip2_act" joint="openarm_left_finger_joint2"  class="gripper"      ctrlrange="0 0.80"/>
 
     <!-- ── RIGHT ARM ─────────────────────────────────────────────── -->
     <position name="right_j1_act" joint="openarm_right_joint1"         class="arm_shoulder" ctrlrange="-1.3963 3.4907"/>
@@ -78,7 +79,8 @@
     <position name="right_j5_act" joint="openarm_right_joint5"         class="arm_wrist"    ctrlrange="-1.5708 1.5708"/>
     <position name="right_j6_act" joint="openarm_right_joint6"         class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
     <position name="right_j7_act" joint="openarm_right_joint7"         class="arm_wrist"    ctrlrange="-0.7854 0.7854"/>
-    <position name="right_grip_act" joint="openarm_right_finger_joint1" class="gripper"     ctrlrange="-1.5708 0"/>
+    <position name="right_grip1_act" joint="openarm_right_finger_joint1" class="gripper"     ctrlrange="-0.80 0"/>
+    <position name="right_grip2_act" joint="openarm_right_finger_joint2" class="gripper"     ctrlrange="0 0.80"/>
   </actuator>
 
   <!-- ================================================================
